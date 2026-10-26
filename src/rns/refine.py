@@ -279,9 +279,27 @@ def union_detections(stardist, instanseg, shape, origin, p):
     return union, added
 
 
-def consolidate(union, coarse, shape, origin, p):
-    """Replace >= 2 fine pieces by one coarse StarDist instance when it is compact, covers each piece and one piece
-    dominates (a split nucleus); two similar pieces are two touching nuclei and stay separate."""
+def _no_gap(pieces, region, odm_s, ps, um, p):
+    """True if the material between the pieces (pixels of `region` within 1 um of two different pieces) is as
+    nuclear as the pieces themselves: nuclear OD >= coarse_no_gap x the paler piece's mean OD and mean nucleus
+    probability > 0.5. Two separate nuclei meet along a paler line; one nucleus cut by a detector (often along a
+    fold or groove, which is darker) does not."""
+    d = _iters(1.0, um)
+    near = np.zeros(region.shape, np.int32)
+    for m in pieces:
+        near += ndi.binary_dilation(m, iterations=d)
+    cut = region & (near >= 2)
+    if cut.sum() < 5:
+        return False
+    paler = min(float(odm_s[m].mean()) for m in pieces)
+    return float(odm_s[cut].mean()) >= p.coarse_no_gap * paler and float(ps[cut].mean()) > 0.5
+
+
+def consolidate(union, coarse, shape, origin, p, odm_s=None, ps=None, um=None):
+    """Replace >= 2 fine pieces by one coarse StarDist instance when it is compact (solidity >= 0.90) and covers each
+    piece, and either one piece dominates (a big piece + fragments) or the coarse outline is not elongated
+    (major/minor <= 1.4) and there is no pale gap between the pieces (a nucleus cut along a fold). Similar pieces
+    separated by a paler line, or side by side in an elongated outline, are touching nuclei and stay separate."""
     fm = [poly_mask(q, shape, origin) for q in union]
     used, out = set(), []
     for cp in coarse:
@@ -292,7 +310,16 @@ def consolidate(union, coarse, shape, origin, p):
         if not rp or rp[0].solidity < p.coarse_min_solidity:
             continue
         inside = [i for i, m in enumerate(fm) if i not in used and m.sum() and (m & cm).sum() / m.sum() >= p.coarse_min_inside]
-        if len(inside) >= 2 and max(fm[i].sum() for i in inside) >= p.coarse_dominant_frac * cm.sum():
+        if len(inside) < 2:
+            continue
+        dominant = max(fm[i].sum() for i in inside) >= p.coarse_dominant_frac * cm.sum()
+        # the no-gap path also needs an ordinary shape: two nuclei side by side make an elongated union (1.7 in testing),
+        # one nucleus cut along a fold does not (1.1-1.2); overlapping nuclei are darker where they overlap, so the
+        # no-gap test alone cannot tell them from a fold
+        elong = rp[0].axis_major_length / max(rp[0].axis_minor_length, 1e-6)
+        continuous = (p.coarse_no_gap > 0 and odm_s is not None and ps is not None and elong <= p.coarse_no_gap_max_elong
+                      and _no_gap([fm[i] for i in inside], cm, odm_s, ps, um, p))
+        if dominant or continuous:
             used.update(inside)
             out.append(cp)
     return out + [q for i, q in enumerate(union) if i not in used]
@@ -509,7 +536,7 @@ def refine_image(regions, um, params=None):
         ps = cv2.GaussianBlur(pm.astype(np.float32), (0, 0), max(0.7, 0.3 / um))
         odm_s = nuclear_od(rgb, um)
         union, added = union_detections(r['stardist'], r.get('instanseg', []), shp, origin, p)
-        seeds = consolidate(union, r.get('stardist_coarse', []), shp, origin, p)
+        seeds = consolidate(union, r.get('stardist_coarse', []), shp, origin, p, odm_s, ps, um)
         occ = np.zeros(shp, np.int32)
         for q in seeds:
             occ += poly_mask(q, shp, origin)

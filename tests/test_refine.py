@@ -110,3 +110,41 @@ def test_refine_image_tightens_outlines_and_flags_defocus():
         assert by_pos[i]['state'] == 'sharp'
     assert by_pos[3]['state'] in ('blurred', 'blob', 'intermediate')
     assert by_pos[3]['focus_rel'] < min(by_pos[i]['focus_rel'] for i in range(3))
+
+
+def _two_scenes():
+    """(a) one nucleus with a dark fold, cut by the fine detector into two similar halves; (b) two touching nuclei side
+    by side. In both, the coarse detector draws one compact outline around everything."""
+    out = []
+    for kind in ('fold', 'pair'):
+        img = np.zeros((400, 400, 3), np.float32) + GLASS
+        if kind == 'fold':
+            cv2.circle(img, (200, 200), 70, CYTO, -1)
+            cv2.circle(img, (200, 200), 30, NUC, -1)
+            cv2.line(img, (200, 172), (200, 228), (60, 50, 110), 3)          # darker fold along the cut
+            fine = [np.r_[circle(200, 200, 33)[16:49], [[200, 200]]], np.r_[circle(200, 200, 33)[48:], circle(200, 200, 33)[:17], [[200, 200]]]]
+            coarse = [circle(200, 200, 33)]
+            truth = [(200, 200, 30)]
+        else:
+            cv2.ellipse(img, (200, 200), (100, 60), 0, 0, 360, CYTO, -1)
+            for cx in (172, 228):
+                cv2.circle(img, (cx, 200), 28, NUC, -1)
+            fine = [circle(172, 200, 30), circle(228, 200, 30)]
+            t = np.linspace(0, 2 * math.pi, 64, endpoint=False)
+            coarse = [np.c_[200 + 60 * np.cos(t), 200 + 31 * np.sin(t)]]
+            truth = [(172, 200, 28), (228, 200, 28)]
+        img = cv2.GaussianBlur(img, (0, 0), 1.0)
+        img = np.clip(img + np.random.default_rng(1).normal(0, 2, img.shape), 0, 255).astype(np.uint8)
+        others = [circle(80, 80, 22), circle(320, 320, 24), circle(80, 320, 20)]     # a few more nuclei for training
+        for cx, cy, r in ((80, 80, 20), (320, 320, 22), (80, 320, 18)):
+            cv2.circle(img, (cx, cy), r, NUC, -1)
+        out.append((kind, img, fine + others, coarse, truth))
+    return out
+
+
+def test_fold_is_one_nucleus_but_side_by_side_pair_stays_two():
+    for kind, img, fine, coarse, truth in _two_scenes():
+        region = dict(rgb=img, origin=(0, 0), stardist=fine, stardist_coarse=coarse, instanseg=[])
+        out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1))
+        centre = [d for d in out[0] if np.hypot(*(np.asarray(d['poly']).mean(0) - (200, 200))) < 60]
+        assert len(centre) == len(truth), (kind, len(centre))

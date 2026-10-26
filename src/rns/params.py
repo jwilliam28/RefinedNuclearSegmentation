@@ -11,6 +11,8 @@ class Params:
     coarse_min_solidity: float = 0.90
     coarse_min_inside: float = 0.60         # each fine piece must lie >= 60 % inside the coarse instance
     coarse_dominant_frac: float = 0.55      # and the largest piece must be >= 55 % of the coarse area
+    coarse_no_gap: float = 0.85             # or: no pale gap between the pieces (OD on the cuts >= 0.85 x paler piece; 0 = off)
+    coarse_no_gap_max_elong: float = 1.4    # ... and only if the coarse outline's major/minor axis ratio is <= 1.4
 
     # colour classifier: nucleus vs background (cytoplasm ring + glass pooled), trained per image on the detections
     cyto_ring_um: tuple = (1.5, 4.0)

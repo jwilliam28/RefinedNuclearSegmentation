@@ -10,7 +10,7 @@ This tool finds nuclei on brightfield images using two published detectors, Star
 | Pale parts of a nucleus are cut off | **Classifier training:** it learns from the inner half of *every* detected nucleus, pale ones included. **Boundary search:** rays move inward from outside the nucleus and stop at the first sustained nucleus pixels. |
 | The detector outline stops short of a large or irregular nucleus | **Growth:** the search area is extended along the nucleus probability, up to 6 µm. It only passes through pixels at least 0.6× as dark as the nucleus core, and only where the new part is closed off by cytoplasm. In dense groups the growth would run into the neighbours, so it is not used there. |
 | A nucleus that touches similar nuclei is missed | **Lower threshold:** StarDist runs at threshold 0.35 with a 0.35 µm model pixel. **Second detector:** InstanSeg nuclei are added wherever StarDist found nothing. |
-| One nucleus is split into pieces | **Coarse check:** a coarse StarDist pass (threshold 0.5, 0.5 µm) can consolidate the pieces. **Merge:** two touching pieces are joined when the union is compact and the chromatin continues across the cut. |
+| One nucleus is split into pieces (often along a fold) | **Coarse check:** a coarse StarDist pass (threshold 0.5, 0.5 µm) can consolidate the pieces when no pale gap separates them. **Merge:** two touching pieces are joined when the union is compact and the chromatin continues across the cut. |
 | Outlines are jagged or follow chromatin clumps | **Fourier smoothing:** detail at a 2 µm wavelength is halved and finer detail is strongly damped, at the same physical scale on every scanner. **Outline choice:** the darkness outline is used only when it sits on a clearly stronger edge. |
 | Outlines are drawn on defocused parts of thick groups | **Focus flag:** every nucleus is marked sharp, intermediate or blurred relative to the sharp nuclei in its own field, so analyses can include or exclude nuclei by focus. |
 
@@ -22,7 +22,11 @@ This tool finds nuclei on brightfield images using two published detectors, Star
 
    It writes the detections as GeoJSON in full-resolution image coordinates and saves each box as a PNG. Outputs left by an earlier run in the same folder are deleted first, and `boxes.json` records whether InstanSeg ran.
 2. **Union.** The two detectors' nuclei are combined. An InstanSeg nucleus is added only where StarDist covers less than 10 % of it.
-3. **Consolidate.** Fragments are replaced by one coarse-pass nucleus when that nucleus is compact (solidity ≥ 0.90), covers each fragment, and one fragment dominates.
+3. **Consolidate.** Fragments are replaced by one coarse-pass nucleus when that nucleus is compact (solidity ≥ 0.90) and covers each fragment, and either:
+   - one fragment dominates (≥ 55 % of the coarse area); or
+   - the coarse outline is not elongated (axis ratio ≤ 1.4), and the material between the fragments is as nuclear as the fragments: nuclear OD ≥ 0.85× the paler fragment and nucleus probability > 0.5.
+
+   The second path catches a nucleus cut along a fold or groove, which is darker, not paler. Two touching nuclei meet along a paler line or sit side by side in an elongated outline, so they stay separate.
 4. **Classify pixels.** A two-class logistic regression gives each pixel a nucleus probability. The negative class pools cytoplasm and glass. It uses:
    - optical density (OD) per channel and OD chromaticity;
    - OD sum;
