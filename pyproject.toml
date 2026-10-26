@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "refined-nuclear-segmentation"
+version = "0.1.0"
+description = "StarDist + InstanSeg nuclei on Papanicolaou and other brightfield images, with colour-classifier / radial outline refinement and per-nucleus focus flags"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "scikit-image>=0.19",
+    "scikit-learn>=1.0",
+    "opencv-python-headless>=4.5",
+    "pillow>=9",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+rns = "rns.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+rns = ["groovy/*.groovy"]

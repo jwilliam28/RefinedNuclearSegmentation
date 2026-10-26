@@ -1,0 +1,52 @@
+# model weights are downloaded, never committed
+models/
+*.pb
+*.pt
+*.pth
+*.onnx
+*.zip
+
+# images and outputs stay local
+data/
+runs/
+outputs/
+*.svs
+*.ndpi
+*.mrxs
+*.tif
+*.tiff
+*.ome.tif
+*.zarr/
+*.geojson
+!tests/**/*.geojson
+
+# rns outputs, wherever --out points (they contain crops of slides)
+regions/
+refined/
+boxes.json
+run_info.json
+boxes*.csv
+nuclei*.csv
+*.png
+*.jpg
+*.jpeg
+!docs/**/*.png
+
+# other slide and project formats
+*.czi
+*.vsi
+*.scn
+*.bif
+*.dcm
+*.isyntax
+*.qptiff
+*.qpproj
+*.qpdata
+*.pkl
+
+__pycache__/
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+.venv/
