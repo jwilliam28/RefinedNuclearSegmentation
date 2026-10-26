@@ -131,3 +131,8 @@ nuclei, info = refine_image(regions, um=0.25, params=Params())
 - **QuPath:** Bankhead P, et al. *QuPath: Open source software for digital pathology image analysis.* Sci Rep 7, 16878 (2017).
 
 The models are not included in this repository. Check the licences of the StarDist model and of the InstanSeg model's training data (listed in its README) before you use them.
+
+## Licence
+
+BSD 3-Clause; see [LICENSE](LICENSE). StarDist, InstanSeg and QuPath are separate projects under their own licences, and
+the models they use are downloaded separately.
