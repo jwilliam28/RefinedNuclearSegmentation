@@ -325,18 +325,34 @@ def consolidate(union, coarse, shape, origin, p, odm_s=None, ps=None, um=None):
     return out + [q for i, q in enumerate(union) if i not in used]
 
 
+def _bbox(m):
+    ys, xs = np.nonzero(m)
+    return ys.min(), ys.max(), xs.min(), xs.max()
+
+
 def _merge_pieces(keep, odm_s, p):
     """Two touching pieces become one nucleus if (halves) the union is compact, not elongated and of ordinary size,
-    or (fragment) one piece dominates, the union is compact and chromatin continues across the cut."""
+    or (fragment) one piece dominates, the union is compact and chromatin continues across the cut.
+    Only pairs whose bounding boxes lie within 2 px are tested, each in a small window (same result as testing every
+    pair on the full frame, at a fraction of the cost in crowded fields)."""
     if len(keep) < 2:
         return keep
     med = float(np.median([m.sum() for m in keep]))
+    H, W = keep[0].shape
+    boxes = [_bbox(m) for m in keep]
     changed = True
     while changed:
         changed = False
         for i in range(len(keep)):
+            bi = boxes[i]
             for j in range(i + 1, len(keep)):
-                a, b = keep[i], keep[j]
+                bj = boxes[j]
+                if bi[0] > bj[1] + 2 or bj[0] > bi[1] + 2 or bi[2] > bj[3] + 2 or bj[2] > bi[3] + 2:
+                    continue
+                win = (slice(max(0, min(bi[0], bj[0]) - 3), min(H, max(bi[1], bj[1]) + 4)),
+                       slice(max(0, min(bi[2], bj[2]) - 3), min(W, max(bi[3], bj[3]) + 4)))
+                a, b = keep[i][win], keep[j][win]
+                od = odm_s[win]
                 border = ndi.binary_dilation(a) & ndi.binary_dilation(b)
                 if border.sum() < 0.3 * 2 * math.sqrt(min(a.sum(), b.sum()) / math.pi):
                     continue
@@ -349,11 +365,15 @@ def _merge_pieces(keep, odm_s, p):
                 halves = (r0.solidity >= p.halves_min_solidity and elong <= p.halves_max_elongation
                           and u.sum() <= p.halves_max_area_vs_median * med)
                 dom = max(a.sum(), b.sum()) / max(u.sum(), 1)
-                no_gap = odm_s[border].mean() >= p.fragment_no_gap * min(odm_s[a].mean(), odm_s[b].mean())
+                no_gap = od[border].mean() >= p.fragment_no_gap * min(od[a].mean(), od[b].mean())
                 fragment = dom >= p.fragment_dominant_frac and r0.solidity >= p.fragment_min_solidity and no_gap
                 if halves or fragment:
-                    keep[i] = u
+                    m = np.zeros((H, W), bool)
+                    m[win] = u
+                    keep[i] = m
+                    boxes[i] = _bbox(m)
                     keep.pop(j)
+                    boxes.pop(j)
                     changed = True
                     break
             if changed:
@@ -376,10 +396,12 @@ def resolve(polys, pmap, origin, um, odm_s, p):
         rp = regionprops(m.astype(np.uint8))
         if not rp or rp[0].solidity < p.min_solidity:
             continue
-        ring = ndi.binary_dilation(m, iterations=r_out) & ~ndi.binary_dilation(m, iterations=r_in)
-        ring &= odm_s > 0.08                                  # ignore glass in the surround
-        ring &= (occ - m.astype(np.int32)) == 0               # ignore neighbouring nuclei
-        if ring.sum() > max(10, 0.3 * m.sum()) and odm_s[m].mean() < p.min_contrast * odm_s[ring].mean():
+        wy, wx = _window(m, r_out + 2)                        # the surround test in a window around the nucleus
+        mw, ow = m[wy, wx], odm_s[wy, wx]
+        ring = ndi.binary_dilation(mw, iterations=r_out) & ~ndi.binary_dilation(mw, iterations=r_in)
+        ring &= ow > 0.08                                     # ignore glass in the surround
+        ring &= (occ[wy, wx] - mw.astype(np.int32)) == 0      # ignore neighbouring nuclei
+        if ring.sum() > max(10, 0.3 * mw.sum()) and ow[mw].mean() < p.min_contrast * ow[ring].mean():
             continue
         keep.append(m)
     keep = _merge_pieces(keep, odm_s, p)
