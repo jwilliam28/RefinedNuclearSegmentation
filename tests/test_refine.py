@@ -8,6 +8,8 @@ import pytest
 from rns import Params, refine_image
 from rns.refine import (focus_measure, fourier_smooth, nuclear_od, poly_mask, polygon_area, resolve)
 
+# synthetic scenes: the nucleus filter (trained on real Pap / urine images) is switched off here and tested on its own
+# in test_nucleus_filter.py
 UM = 0.25
 GLASS = (245, 245, 242)
 CYTO = (150, 215, 215)       # cyan: absorbs red only
@@ -77,7 +79,7 @@ def test_short_detector_outline_grows_to_the_nucleus():
     short = circle(cx - 0.3 * r, cy, 0.75 * r)                 # misses the right third
     others = [circle(x, y, q * 1.1) for i, (x, y, q) in enumerate(nuclei) if i != 1]
     region = dict(rgb=img, origin=(0, 0), stardist=others + [short], stardist_coarse=[], instanseg=[])
-    out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1))
+    out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1, nucleus_filter=False, grow_um=6.0))
     n = min(out[0], key=lambda d: np.hypot(*(np.asarray(d['poly']).mean(0) - (cx, cy))))
     assert n['area_um2'] == pytest.approx(math.pi * r * r * UM * UM, rel=0.15)
     assert np.asarray(n['poly'])[:, 0].max() > cx + 0.85 * r
@@ -99,7 +101,7 @@ def test_resolve_outputs_do_not_overlap():
 def test_refine_image_tightens_outlines_and_flags_defocus():
     img, nuclei = scene()
     region = dict(rgb=img, origin=(0, 0), stardist=detector_polys(nuclei), stardist_coarse=[], instanseg=[])
-    out, info = refine_image([region], UM, Params(focus_min_ref_nuclei=1))
+    out, info = refine_image([region], UM, Params(focus_min_ref_nuclei=1, nucleus_filter=False))
     nn = out[0]
     assert len(nn) == 4
     assert info['classifier_train_accuracy'] > 0.9
@@ -145,6 +147,6 @@ def _two_scenes():
 def test_fold_is_one_nucleus_but_side_by_side_pair_stays_two():
     for kind, img, fine, coarse, truth in _two_scenes():
         region = dict(rgb=img, origin=(0, 0), stardist=fine, stardist_coarse=coarse, instanseg=[])
-        out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1))
+        out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1, nucleus_filter=False))
         centre = [d for d in out[0] if np.hypot(*(np.asarray(d['poly']).mean(0) - (200, 200))) < 60]
         assert len(centre) == len(truth), (kind, len(centre))

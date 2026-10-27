@@ -82,7 +82,7 @@ def write_geojson(path, nuclei_by_region, regions, include_blobs=False):
 
 def write_csv(path, nuclei_by_region, regions, include_blobs=False):
     cols = ['box_id', 'nucleus', 'state', 'centroid_x', 'centroid_y', 'area_um2', 'perimeter_um', 'circularity',
-            'solidity', 'convexity', 'nuclear_od_mean', 'focus_fm', 'focus_rel']
+            'solidity', 'convexity', 'nuclear_od_mean', 'focus_fm', 'focus_rel', 'p_nucleus']
     with open(path, 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(cols)
@@ -117,3 +117,18 @@ def write_overlay(path, rgb, origin, nuclei, size=None):
         q = [((x - origin[0]) * k, (y - origin[1]) * k) for x, y in np.asarray(n['poly'], float)]
         d.line(q + [q[0]], fill=tuple(COLOURS[n['state']]), width=1)
     im.save(path)
+
+
+def write_filter_table(path, table, regions):
+    """Every object the nucleus filter saw (kept or removed), with its features: add a 'label' column (1 = nucleus,
+    0 = not) to some rows and retrain with scripts/train_nucleus_filter.py."""
+    if not table:
+        return 0
+    cols = ['box_id', 'centroid_x', 'centroid_y', 'p_nucleus', 'kept'] + [k for k in table[0] if k not in ('region', 'centroid_x', 'centroid_y', 'p_nucleus', 'kept')]
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(cols)
+        for t in table:
+            row = dict(t, box_id=regions[t['region']]['id'])
+            w.writerow([_fmt(k, row.get(k)) for k in cols])
+    return len(table)

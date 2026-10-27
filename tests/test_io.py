@@ -36,7 +36,7 @@ def test_round_trip(tmp_path):
     um, regions = rio.load_run(str(tmp_path))
     assert um == UM and len(regions) == 1 and len(regions[0]['stardist']) == 4
     assert regions[0]['instanseg'] == []
-    nuclei, info = refine_image(regions, um, Params(focus_min_ref_nuclei=1))
+    nuclei, info = refine_image(regions, um, Params(focus_min_ref_nuclei=1, nucleus_filter=False))
     n = rio.write_geojson(str(tmp_path / 'nuclei.geojson'), nuclei, regions)
     rio.write_csv(str(tmp_path / 'nuclei.csv'), nuclei, regions)
     back = rio.load_qupath_geojson(str(tmp_path / 'nuclei.geojson'))

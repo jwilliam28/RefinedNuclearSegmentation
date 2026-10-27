@@ -48,6 +48,7 @@ def _refine(a):
     os.makedirs(od, exist_ok=True)
     n = rio.write_geojson(os.path.join(od, 'nuclei.geojson'), nuclei, regions)
     rio.write_csv(os.path.join(od, 'nuclei.csv'), nuclei, regions)
+    rio.write_filter_table(os.path.join(od, 'nucleus_filter_table.csv'), info.pop('nucleus_filter_table', None), regions)
     if not a.no_overlays:
         for r, nn in zip(regions, nuclei):
             rio.write_overlay(os.path.join(od, f"overlay_box_{r['id']:04d}.png"), r['rgb'], r['origin'], nn)

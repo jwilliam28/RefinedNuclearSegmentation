@@ -8,12 +8,12 @@ come out as large smooth blobs. The steps here, applied per image region, are
 2. consolidate fragments that one compact coarse-pass StarDist nucleus covers;
 3. classify   pixels as nucleus vs cytoplasm-or-glass with a per-image logistic regression on stain colour and texture,
               trained on the detections themselves (no manual labels);
-4. boundary   per nucleus, the search area is the detector outline grown along the nucleus probability (up to 6 um,
-              never into another nucleus: detectors often stop short of large or irregular Pap nuclei); 128 rays
-              coming inward from its edge stop at the first sustained nucleus probability > 0.5 and snap to the
-              steepest rise of nuclear optical density (OD); a darkness (Otsu) outline is the alternative, used only
-              when it lies on a clearly stronger edge;
-5. clean up   debris filters, merging of pieces of one nucleus, non-overlapping ownership;
+4. boundary   per nucleus, the search area is the detector outline plus a margin (optionally grown along the nucleus
+              probability, Params.grow_um, off by default; never into another nucleus); the darkness outline
+              (nuclear optical density (OD) above an Otsu threshold estimated on the nucleus plus a surround ring,
+              glass left out) is used first; where it fails, 128 rays coming inward from the edge stop at the first
+              sustained nucleus probability > 0.5 and snap to the steepest rise of OD (Params.darkness_preference);
+5. clean up   debris filters, non-overlapping ownership (optional merging of touching pieces, off by default);
 6. smooth     Fourier smoothing with a fixed physical cutoff (2 um), the same on every scanner;
 7. focus      edge gradient of glass-normalised luminance per nucleus, divided by the same field's sharp-nucleus
               reference: sharp >= 0.75, intermediate, blurred < 0.50. A flag, not a filter: the gradient also
@@ -66,6 +66,56 @@ def poly_mask(poly, shape, origin):
     return m.astype(bool)
 
 
+def poly_mask_local(poly, shape, origin, pad=0):
+    """The pixels poly_mask sets, as (mask, y0, x0): a window of the frame around the polygon's bounding box grown by
+    `pad` pixels (clipped to the frame). Same rasterisation as poly_mask (integer shift), without a full-frame array."""
+    q = np.round(np.asarray(poly, float) - np.asarray(origin, float)).astype(np.int32)
+    H, W = shape
+    x0, y0 = max(0, int(q[:, 0].min()) - pad), max(0, int(q[:, 1].min()) - pad)
+    x1, y1 = min(W, int(q[:, 0].max()) + pad + 1), min(H, int(q[:, 1].max()) + pad + 1)
+    if x1 <= x0 or y1 <= y0:
+        return np.zeros((0, 0), bool), 0, 0
+    m = np.zeros((y1 - y0, x1 - x0), np.uint8)
+    cv2.fillPoly(m, [q - np.array([x0, y0], np.int32)], 1)
+    return m.astype(bool), y0, x0
+
+
+def _sl(lm):
+    m, y0, x0 = lm
+    return slice(y0, y0 + m.shape[0]), slice(x0, x0 + m.shape[1])
+
+
+def _crop(lm, wy, wx):
+    """A local mask restricted to the frame window (wy, wx)."""
+    m, y0, x0 = lm
+    out = np.zeros((wy.stop - wy.start, wx.stop - wx.start), bool)
+    ya, yb = max(wy.start, y0), min(wy.stop, y0 + m.shape[0])
+    xa, xb = max(wx.start, x0), min(wx.stop, x0 + m.shape[1])
+    if ya < yb and xa < xb:
+        out[ya - wy.start:yb - wy.start, xa - wx.start:xb - wx.start] = m[ya - y0:yb - y0, xa - x0:xb - x0]
+    return out
+
+
+def _overlap(a, b):
+    """Number of pixels two local masks share."""
+    (ma, ay, ax), (mb, by, bx) = a, b
+    ya, yb = max(ay, by), min(ay + ma.shape[0], by + mb.shape[0])
+    xa, xb = max(ax, bx), min(ax + ma.shape[1], bx + mb.shape[1])
+    if ya >= yb or xa >= xb:
+        return 0
+    return int((ma[ya - ay:yb - ay, xa - ax:xb - ax] & mb[ya - by:yb - by, xa - bx:xb - bx]).sum())
+
+
+def _local_window(lm, pad, shape):
+    """What _window(full mask, pad) returns, from a local mask whose window already extends >= pad past the polygon:
+    (wy, wx, mask in that window)."""
+    m, y0, x0 = lm
+    ys, xs = np.nonzero(m)
+    wy = slice(max(0, y0 + ys.min() - pad), min(shape[0], y0 + ys.max() + pad + 1))
+    wx = slice(max(0, x0 + xs.min() - pad), min(shape[1], x0 + xs.max() + pad + 1))
+    return wy, wx, m[wy.start - y0:wy.stop - y0, wx.start - x0:wx.stop - x0]
+
+
 def _iters(um_dist, um, minimum=1):
     return max(minimum, int(round(um_dist / um)))
 
@@ -88,14 +138,15 @@ class NucleusClassifier:
         for rgb, polys, origin in regions:
             F = features(rgb, um)
             shp = rgb.shape[:2]
-            masks = [poly_mask(q, shp, origin) for q in polys]
             allm = np.zeros(shp, bool)
             core = np.zeros(shp, bool)
-            for m in masks:
-                allm |= m
+            for q in polys:
+                lm = poly_mask_local(q, shp, origin, 1)
+                m, sl = lm[0], _sl(lm)
+                allm[sl] |= m
                 if m.sum() > 20:                       # inner half of every instance: pale nuclei included, rims never
                     dt = ndi.distance_transform_edt(m)
-                    core |= dt >= 0.5 * dt.max()
+                    core[sl] |= dt >= 0.5 * dt.max()
             d_in = ndi.binary_dilation(allm, iterations=_iters(p.cyto_ring_um[0], um))
             d_out = ndi.binary_dilation(allm, iterations=_iters(p.cyto_ring_um[1], um, 2))
             luma = rgb.mean(2)
@@ -204,11 +255,19 @@ def radial_outline(ps, m0, reach, odm_s, um, p):
     return np.c_[cx + np.cos(th) * med, cy + np.sin(th) * med]
 
 
-def darkness_outline(m0, comp, others, odm_s, um):
-    """Otsu on nuclear OD inside (detector outline + grown component) dilated 1 um; largest component, closed,
-    filled, smoothed. Returns a mask in the window frame."""
+def darkness_outline(m0, comp, others, odm_s, um, p=None):
+    """Darkness outline: pixels of (detector outline + grown component) dilated 1 um whose nuclear OD is above an Otsu
+    threshold; the component overlapping the detector outline most, closed, filled, smoothed. Returns a mask in the
+    window frame. The threshold is estimated on a WIDER sample - the same region plus a surround ring of
+    max(1 um, darkness_ring_frac x the detector outline's equivalent radius), glass (OD <= darkness_glass_od) left out -
+    so that it falls between nucleus and cytoplasm: estimated on the 1 um region alone, a large nucleus fills most of
+    the sample and the threshold split it into its darker and paler chromatin (large LSIL nuclei lost up to half
+    their area, 2026-10-26)."""
+    p = p or Params()
     reg = ndi.binary_dilation(m0 | comp, iterations=_iters(1.0, um)) & ~others
-    v = odm_s[reg]
+    req = math.sqrt(m0.sum() / math.pi) * um
+    wide = ndi.binary_dilation(m0 | comp, iterations=_iters(max(1.0, p.darkness_ring_frac * req), um)) & ~others
+    v = odm_s[wide & (odm_s > p.darkness_glass_od)]
     if v.size < 30:
         return None
     try:
@@ -218,7 +277,10 @@ def darkness_outline(m0, comp, others, odm_s, um):
     cl = sklabel(reg & (odm_s > t))
     if cl.max() == 0:
         return None
-    m = cl == (np.argmax(np.bincount(cl.ravel())[1:]) + 1)
+    ov = np.bincount(cl[m0].ravel(), minlength=cl.max() + 1)[1:]
+    if ov.max() == 0:
+        return None
+    m = cl == (np.argmax(ov) + 1)
     m = ndi.binary_fill_holes(ndi.binary_closing(m, iterations=_iters(0.5, um)))
     return ndi.gaussian_filter(m.astype(float), max(1.0, 0.5 / um)) > 0.5
 
@@ -231,50 +293,74 @@ def mask_contour(m, origin):
     return np.c_[c[:, 1] - 1, c[:, 0] - 1] + np.asarray(origin, float)
 
 
-def edge_score(poly, odm_s, origin):
+def edge_gradient(odm_s):
     gy, gx = np.gradient(odm_s)
-    g = np.hypot(gx, gy)
+    return np.hypot(gx, gy)
+
+
+def edge_score(poly, odm_s, origin, g=None):
+    g = edge_gradient(odm_s) if g is None else g
     q = np.round(np.asarray(poly, float) - np.asarray(origin, float)).astype(int)
     q[:, 0] = np.clip(q[:, 0], 0, g.shape[1] - 1)
     q[:, 1] = np.clip(q[:, 1], 0, g.shape[0] - 1)
     return float(g[q[:, 1], q[:, 0]].mean())
 
 
-def seed_outline(poly, occ, ps, odm_s, origin, um, p):
+def seed_outline(poly, occ, ps, odm_s, origin, um, p, g=None):
     """Refined outline of one detected nucleus (full-image coordinates), or None. occ counts how many seeds cover
-    each pixel of the region (used to keep the search out of neighbouring nuclei)."""
-    m_full = poly_mask(poly, ps.shape, origin)
-    if m_full.sum() < 10:
+    each pixel of the region (used to keep the search out of neighbouring nuclei); g = edge_gradient(odm_s), passed
+    in so that it is computed once per region."""
+    pad = _iters(p.grow_um + p.ray_margin_um + 2.0, um)
+    lm = poly_mask_local(poly, ps.shape, origin, pad)
+    if lm[0].sum() < 10:
         return None
-    wy, wx = _window(m_full, _iters(p.grow_um + p.ray_margin_um + 2.0, um))
-    m0 = m_full[wy, wx]
+    wy, wx, m0 = _local_window(lm, pad, ps.shape)
     others = ((occ[wy, wx] - m0.astype(np.int32)) > 0) & ~m0
     ps_w, od_w = ps[wy, wx], odm_s[wy, wx]
     reach, comp = reach_mask(m0, others, ps_w, od_w, um, p)
     o = (origin[0] + wx.start, origin[1] + wy.start)
     a = radial_outline(ps_w, m0, reach, od_w, um, p)
     a = a + np.asarray(o, float) if a is not None and len(a) > 5 else None
-    bm = darkness_outline(m0, comp, others, od_w, um)
+    bm = darkness_outline(m0, comp, others, od_w, um, p)
     b = mask_contour(bm, o) if bm is not None else None
     b = b if b is not None and len(b) > 5 else None
     if a is not None and b is not None:          # the smoother radial outline unless the darkness edge is clearly stronger
-        return b if edge_score(b, odm_s, origin) >= p.darkness_preference * edge_score(a, odm_s, origin) else a
+        g = edge_gradient(odm_s) if g is None else g
+        return b if edge_score(b, odm_s, origin, g) >= p.darkness_preference * edge_score(a, odm_s, origin, g) else a
     return a if a is not None else b
 
 
 # ---------------------------------------------------------------- union, consolidation, clean-up
 
+def agreed_seeds(stardist, instanseg):
+    """The StarDist outlines whose centre lies inside an InstanSeg outline: objects both detectors find (on Pap, objects
+    only one detector finds were mostly folds, cell edges and debris - cytopathologist-graded random objects)."""
+    if not instanseg:
+        return []
+    boxes = [(np.asarray(q, float).min(0), np.asarray(q, float).max(0)) for q in instanseg]
+    out = []
+    for q in stardist:
+        c = np.asarray(q, float).mean(0)
+        for (lo, hi), qi in zip(boxes, instanseg):
+            if lo[0] <= c[0] <= hi[0] and lo[1] <= c[1] <= hi[1] and                     cv2.pointPolygonTest(np.asarray(qi, np.float32).reshape(-1, 1, 2), (float(c[0]), float(c[1])), False) >= 0:
+                out.append(q)
+                break
+    return out
+
+
 def union_detections(stardist, instanseg, shape, origin, p):
     union = list(stardist)
     cover = np.zeros(shape, bool)
     for q in stardist:
-        cover |= poly_mask(q, shape, origin)
+        lm = poly_mask_local(q, shape, origin)
+        cover[_sl(lm)] |= lm[0]
     added = 0
     for q in instanseg:
-        mi = poly_mask(q, shape, origin)
-        if mi.sum() and (mi & cover).sum() / mi.sum() < p.instanseg_add_max_cover:
+        lm = poly_mask_local(q, shape, origin)
+        mi, sl = lm[0], _sl(lm)
+        if mi.sum() and (mi & cover[sl]).sum() / mi.sum() < p.instanseg_add_max_cover:
             union.append(q)
-            cover |= mi
+            cover[sl] |= mi
             added += 1
     return union, added
 
@@ -300,25 +386,34 @@ def consolidate(union, coarse, shape, origin, p, odm_s=None, ps=None, um=None):
     piece, and either one piece dominates (a big piece + fragments) or the coarse outline is not elongated
     (major/minor <= 1.4) and there is no pale gap between the pieces (a nucleus cut along a fold). Similar pieces
     separated by a paler line, or side by side in an elongated outline, are touching nuclei and stay separate."""
-    fm = [poly_mask(q, shape, origin) for q in union]
+    fm = [poly_mask_local(q, shape, origin) for q in union]           # local masks: only overlapping windows are compared
+    fsum = [int(lm[0].sum()) for lm in fm]
     used, out = set(), []
     for cp in coarse:
-        cm = poly_mask(cp, shape, origin)
-        if cm.sum() < 20:
+        clm = poly_mask_local(cp, shape, origin)
+        cm = clm[0]
+        csum = int(cm.sum())
+        if csum < 20:
             continue
         rp = regionprops(cm.astype(np.uint8))
         if not rp or rp[0].solidity < p.coarse_min_solidity:
             continue
-        inside = [i for i, m in enumerate(fm) if i not in used and m.sum() and (m & cm).sum() / m.sum() >= p.coarse_min_inside]
+        inside = [i for i in range(len(fm)) if i not in used and fsum[i] and _overlap(fm[i], clm) / fsum[i] >= p.coarse_min_inside]
         if len(inside) < 2:
             continue
-        dominant = max(fm[i].sum() for i in inside) >= p.coarse_dominant_frac * cm.sum()
+        dominant = max(fsum[i] for i in inside) >= p.coarse_dominant_frac * csum
         # the no-gap path also needs an ordinary shape: two nuclei side by side make an elongated union (1.7 in testing),
         # one nucleus cut along a fold does not (1.1-1.2); overlapping nuclei are darker where they overlap, so the
         # no-gap test alone cannot tell them from a fold
         elong = rp[0].axis_major_length / max(rp[0].axis_minor_length, 1e-6)
-        continuous = (p.coarse_no_gap > 0 and odm_s is not None and ps is not None and elong <= p.coarse_no_gap_max_elong
-                      and _no_gap([fm[i] for i in inside], cm, odm_s, ps, um, p))
+        continuous = False
+        if p.coarse_no_gap > 0 and odm_s is not None and ps is not None and elong <= p.coarse_no_gap_max_elong:
+            # one window holding the coarse outline and its pieces, + the 1 um dilation of _no_gap and a margin
+            d = _iters(1.0, um) + 1
+            sls = [_sl(clm)] + [_sl(fm[i]) for i in inside]
+            wy = slice(max(0, min(a.start for a, _ in sls) - d), min(shape[0], max(a.stop for a, _ in sls) + d))
+            wx = slice(max(0, min(b.start for _, b in sls) - d), min(shape[1], max(b.stop for _, b in sls) + d))
+            continuous = _no_gap([_crop(fm[i], wy, wx) for i in inside], _crop(clm, wy, wx), odm_s[wy, wx], ps[wy, wx], um, p)
         if dominant or continuous:
             used.update(inside)
             out.append(cp)
@@ -330,16 +425,22 @@ def _bbox(m):
     return ys.min(), ys.max(), xs.min(), xs.max()
 
 
+def _bbox_local(lm):
+    m, y0, x0 = lm
+    ys, xs = np.nonzero(m)
+    return y0 + ys.min(), y0 + ys.max(), x0 + xs.min(), x0 + xs.max()
+
+
 def _merge_pieces(keep, odm_s, p):
     """Two touching pieces become one nucleus if (halves) the union is compact, not elongated and of ordinary size,
     or (fragment) one piece dominates, the union is compact and chromatin continues across the cut.
     Only pairs whose bounding boxes lie within 2 px are tested, each in a small window (same result as testing every
-    pair on the full frame, at a fraction of the cost in crowded fields)."""
+    pair on the full frame, at a fraction of the cost in crowded fields). keep: local masks (mask, y0, x0)."""
     if len(keep) < 2:
         return keep
-    med = float(np.median([m.sum() for m in keep]))
-    H, W = keep[0].shape
-    boxes = [_bbox(m) for m in keep]
+    med = float(np.median([lm[0].sum() for lm in keep]))
+    H, W = odm_s.shape
+    boxes = [_bbox_local(lm) for lm in keep]
     changed = True
     while changed:
         changed = False
@@ -351,7 +452,7 @@ def _merge_pieces(keep, odm_s, p):
                     continue
                 win = (slice(max(0, min(bi[0], bj[0]) - 3), min(H, max(bi[1], bj[1]) + 4)),
                        slice(max(0, min(bi[2], bj[2]) - 3), min(W, max(bi[3], bj[3]) + 4)))
-                a, b = keep[i][win], keep[j][win]
+                a, b = _crop(keep[i], *win), _crop(keep[j], *win)
                 od = odm_s[win]
                 border = ndi.binary_dilation(a) & ndi.binary_dilation(b)
                 if border.sum() < 0.3 * 2 * math.sqrt(min(a.sum(), b.sum()) / math.pi):
@@ -368,10 +469,8 @@ def _merge_pieces(keep, odm_s, p):
                 no_gap = od[border].mean() >= p.fragment_no_gap * min(od[a].mean(), od[b].mean())
                 fragment = dom >= p.fragment_dominant_frac and r0.solidity >= p.fragment_min_solidity and no_gap
                 if halves or fragment:
-                    m = np.zeros((H, W), bool)
-                    m[win] = u
-                    keep[i] = m
-                    boxes[i] = _bbox(m)
+                    keep[i] = (u, win[0].start, win[1].start)
+                    boxes[i] = _bbox_local(keep[i])
                     keep.pop(j)
                     boxes.pop(j)
                     changed = True
@@ -384,49 +483,61 @@ def _merge_pieces(keep, odm_s, p):
 def resolve(polys, pmap, origin, um, odm_s, p):
     """Debris filters, merging of pieces, non-overlapping ownership (nearest centroid); sub-pixel contours."""
     shp = pmap.shape
-    allm = [poly_mask(q, shp, origin) for q in polys]
-    occ = np.zeros(shp, np.int32)
-    for m in allm:
-        occ += m
-    keep = []
     r_in, r_out = _iters(1.0, um), _iters(2.5, um, 2)
-    for m in allm:
-        if m.sum() * um * um < p.min_area_um2 or pmap[m].mean() < p.min_mean_prob:
+    allm = [poly_mask_local(q, shp, origin, r_out + 2) for q in polys]
+    occ = np.zeros(shp, np.int32)
+    for lm in allm:
+        occ[_sl(lm)] += lm[0]
+    keep = []
+    for lm in allm:
+        m = lm[0]
+        if m.sum() * um * um < p.min_area_um2 or pmap[_sl(lm)][m].mean() < p.min_mean_prob:
             continue
         rp = regionprops(m.astype(np.uint8))
         if not rp or rp[0].solidity < p.min_solidity:
             continue
-        wy, wx = _window(m, r_out + 2)                        # the surround test in a window around the nucleus
-        mw, ow = m[wy, wx], odm_s[wy, wx]
+        wy, wx, mw = _local_window(lm, r_out + 2, shp)       # the surround test in a window around the nucleus
+        ow = odm_s[wy, wx]
         ring = ndi.binary_dilation(mw, iterations=r_out) & ~ndi.binary_dilation(mw, iterations=r_in)
         ring &= ow > 0.08                                     # ignore glass in the surround
         ring &= (occ[wy, wx] - mw.astype(np.int32)) == 0      # ignore neighbouring nuclei
         if ring.sum() > max(10, 0.3 * mw.sum()) and ow[mw].mean() < p.min_contrast * ow[ring].mean():
             continue
-        keep.append(m)
-    keep = _merge_pieces(keep, odm_s, p)
+        keep.append(lm)
+    if p.merge_pieces:
+        keep = _merge_pieces(keep, odm_s, p)
     if not keep:
         return []
-    stack = np.stack(keep)
-    cent = np.array([ndi.center_of_mass(m) for m in keep])
-    cover = stack.sum(0)
+    # ownership: pixels covered once go to that nucleus, overlaps to the nearest centroid (ties: the lower index)
+    cent = [np.asarray(ndi.center_of_mass(lm[0])) + [lm[1], lm[2]] for lm in keep]
+    cover = np.zeros(shp, np.int32)
+    for lm in keep:
+        cover[_sl(lm)] += lm[0]
     lab = np.zeros(shp, np.int32)
-    one = cover == 1
-    lab[one] = np.argmax(stack[:, one], axis=0) + 1
-    yy, xx = np.nonzero(cover >= 2)
-    if yy.size:
-        D = np.hypot(cent[:, 0:1] - yy[None, :], cent[:, 1:2] - xx[None, :])
-        D[~stack[:, yy, xx]] = np.inf
-        lab[yy, xx] = np.argmin(D, axis=0) + 1
+    best = None
+    for i, lm in enumerate(keep, 1):
+        m, y0, x0 = lm
+        sl = _sl(lm)
+        cw, lw = cover[sl], lab[sl]
+        lw[m & (cw == 1)] = i
+        yy, xx = np.nonzero(m & (cw >= 2))
+        if yy.size:
+            best = np.full(shp, np.inf) if best is None else best
+            d = np.hypot(cent[i - 1][0] - (yy + y0), cent[i - 1][1] - (xx + x0))
+            bw = best[sl]
+            upd = d < bw[yy, xx]
+            bw[yy[upd], xx[upd]] = d[upd]
+            lw[yy[upd], xx[upd]] = i
     out = []
-    for i in range(1, len(keep) + 1):
-        m = lab == i
+    for i, lm in enumerate(keep, 1):
+        sl = _sl(lm)
+        m = lab[sl] == i
         if m.sum() * um * um < p.min_area_um2:
             continue
         cl = sklabel(m)
         if cl.max() > 1:
             m = cl == (np.argmax(np.bincount(cl.ravel())[1:]) + 1)
-        c = mask_contour(m, origin)
+        c = mask_contour(m, (origin[0] + sl[1].start, origin[1] + sl[0].start))
         if c is not None:
             out.append(c)
     return out
@@ -472,12 +583,11 @@ def focus_measure(polys, rgb, origin, um, p):
     e = _iters(p.focus_band_um, um)
     out = []
     for q in polys:
-        m = poly_mask(q, rgb.shape[:2], origin)
-        if m.sum() < 10:
+        lm = poly_mask_local(q, rgb.shape[:2], origin, e + 2)
+        if lm[0].sum() < 10:
             out.append(0.0)
             continue
-        wy, wx = _window(m, e + 2)
-        mw = m[wy, wx]
+        wy, wx, mw = _local_window(lm, e + 2, rgb.shape[:2])
         band = ndi.binary_dilation(mw, iterations=e) & ~ndi.binary_erosion(mw, iterations=e)
         out.append(float(np.percentile(g[wy, wx][band], 90)))
     return out
@@ -549,6 +659,8 @@ def refine_image(regions, um, params=None):
     (the colour classifier and the focus reference are per image).
     Returns one list of nuclei per region (dicts: poly, state, focus_fm, focus_rel, measurements) and run info."""
     p = params or Params()
+    if p.work_pixel_um > 0 and um < p.work_pixel_um / 1.1 and regions:
+        return _refine_resampled(regions, um, p)
     clf = NucleusClassifier(p).fit([(r['rgb'], r['stardist'], r['origin']) for r in regions], um)
     per_region = []
     for r in regions:
@@ -561,25 +673,97 @@ def refine_image(regions, um, params=None):
         seeds = consolidate(union, r.get('stardist_coarse', []), shp, origin, p, odm_s, ps, um)
         occ = np.zeros(shp, np.int32)
         for q in seeds:
-            occ += poly_mask(q, shp, origin)
-        cands = [c for c in (seed_outline(q, occ, ps, odm_s, origin, um, p) for q in seeds) if c is not None]
+            lm = poly_mask_local(q, shp, origin)
+            occ[_sl(lm)] += lm[0]
+        g = edge_gradient(odm_s)
+        cands = [c for c in (seed_outline(q, occ, ps, odm_s, origin, um, p, g) for q in seeds) if c is not None]
         polys = [fourier_smooth(q, um, p.smooth_wavelength_um) for q in resolve(cands, pm, origin, um, odm_s, p)]
         per_region.append(dict(polys=polys, fm=focus_measure(polys, rgb, origin, um, p), odm_s=odm_s, added=added,
                                n_seeds=len(seeds)))
+    n_removed = 0
+    if p.nucleus_filter:
+        # object-level nucleus filter (nucleus_filter.py): detector agreement + object features (+ slide signal if the model
+        # uses it). Its focus
+        # feature uses the pre-filter field references; the final focus states below are computed on the kept objects only.
+        from .nucleus_filter import NucleusFilter, object_features, add_image_features
+        refs0, _ = focus_reference([pr['fm'] for pr in per_region], p)
+        feats = []
+        for r, pr, ref in zip(regions, per_region, refs0):
+            dets = {'stardist': r['stardist'], 'stardist_coarse': r.get('stardist_coarse', []), 'instanseg': r.get('instanseg', [])}
+            pr['feats'] = []
+            for q, fmv in zip(pr['polys'], pr['fm']):
+                f = object_features(q, r['rgb'], r['origin'], um, dets)
+                if f is not None:
+                    f['focus_rel'] = fmv / ref if ref > 0 else float('nan')
+                pr['feats'].append(f)
+                feats.append(f)
+        add_image_features(feats)
+        model = NucleusFilter.load(p.nucleus_filter_model or None)
+        th = p.nucleus_filter_threshold if p.nucleus_filter_threshold > 0 else model.threshold
+        filter_table = []
+        for ri, (r, pr) in enumerate(zip(regions, per_region)):
+            prob = model.proba([f if f is not None else {} for f in pr['feats']])
+            keep = [f is not None and pv >= th for f, pv in zip(pr['feats'], prob)]
+            for q, f, pv, k in zip(pr['polys'], pr['feats'], prob, keep):
+                c = np.asarray(q, float).mean(0)
+                filter_table.append(dict(region=ri, centroid_x=float(c[0]), centroid_y=float(c[1]), p_nucleus=float(pv), kept=bool(k),
+                                         **(f or {})))
+            n_removed += len(keep) - sum(keep)
+            pr['p_nucleus'] = [float(pv) for pv, k in zip(prob, keep) if k]
+            pr['polys'] = [q for q, k in zip(pr['polys'], keep) if k]
+            pr['fm'] = [fmv for fmv, k in zip(pr['fm'], keep) if k]
     refs, img_ref = focus_reference([pr['fm'] for pr in per_region], p)
     out = []
     for r, pr, ref in zip(regions, per_region, refs):
         areas = [polygon_area(q) * um * um for q in pr['polys']]
         rel, states = focus_states(pr['fm'], areas, ref, p)
         nuclei = []
-        for q, f, rl, st in zip(pr['polys'], pr['fm'], rel, states):
-            m = poly_mask(q, r['rgb'].shape[:2], r['origin'])
+        pn = pr.get('p_nucleus', [None] * len(pr['polys']))
+        for q, f, rl, st, pnv in zip(pr['polys'], pr['fm'], rel, states, pn):
+            lm = poly_mask_local(q, r['rgb'].shape[:2], r['origin'])
             meas = shape_measurements(q, um)
-            meas['nuclear_od_mean'] = float(pr['odm_s'][m].mean()) if m.any() else 0.0
-            nuclei.append(dict(poly=q, state=st, focus_fm=f, focus_rel=rl, **meas))
+            meas['nuclear_od_mean'] = float(pr['odm_s'][_sl(lm)][lm[0]].mean()) if lm[0].any() else 0.0
+            nd = dict(poly=q, state=st, focus_fm=f, focus_rel=rl, **meas)
+            if pnv is not None:
+                nd['p_nucleus'] = pnv
+            nuclei.append(nd)
         out.append(nuclei)
     n_all = sum(len(pr['fm']) for pr in per_region)
     info = dict(classifier_train_accuracy=clf.train_accuracy, focus_ref_image=img_ref, focus_ref_fields=refs,
-                n_nuclei=n_all, focus_ref_reliable=n_all >= p.focus_min_ref_nuclei,
+                n_nuclei=n_all, focus_ref_reliable=n_all >= p.focus_min_ref_nuclei, nucleus_filter_removed=n_removed,
+                nucleus_filter_table=filter_table if p.nucleus_filter else None,
                 instanseg_added=[pr['added'] for pr in per_region], seeds=[pr['n_seeds'] for pr in per_region])
+    return out, info
+
+
+def _refine_resampled(regions, um, p):
+    """Images much finer than p.work_pixel_um (over-sampled scans) are refined at that pixel size: every region is
+    resampled (area averaging), the detector outlines are scaled, and the outputs are mapped back to the original
+    full-image pixels. All settings are in micrometres, so only the pixel grid changes."""
+    from dataclasses import replace
+    regs, maps = [], []
+    for r in regions:
+        h, w = r['rgb'].shape[:2]
+        nh, nw = max(1, int(round(h * um / p.work_pixel_um))), max(1, int(round(w * um / p.work_pixel_um)))
+        sx, sy = nw / w, nh / h
+        ox, oy = r['origin']
+        fwd = (lambda q, ox=ox, oy=oy, sx=sx, sy=sy: np.c_[(np.asarray(q, float)[:, 0] - ox + 0.5) * sx - 0.5,
+                                                         (np.asarray(q, float)[:, 1] - oy + 0.5) * sy - 0.5])
+        maps.append((ox, oy, sx, sy))
+        regs.append(dict(r, rgb=cv2.resize(r['rgb'], (nw, nh), interpolation=cv2.INTER_AREA), origin=(0, 0),
+                         **{k: [fwd(q) for q in r.get(k, [])] for k in ('stardist', 'stardist_coarse', 'instanseg')}))
+    um2 = um / float(np.mean([(m[2] + m[3]) / 2 for m in maps]))
+    out, info = refine_image(regs, um2, replace(p, work_pixel_um=0.0))
+
+    def back(q, m):
+        ox, oy, sx, sy = m
+        q = np.asarray(q, float)
+        return np.c_[(q[:, 0] + 0.5) / sx - 0.5 + ox, (q[:, 1] + 0.5) / sy - 0.5 + oy]
+    for nuclei, m in zip(out, maps):
+        for d in nuclei:
+            d['poly'] = back(d['poly'], m)
+    for t in info.get('nucleus_filter_table') or []:
+        c = back([[t['centroid_x'], t['centroid_y']]], maps[t['region']])[0]
+        t['centroid_x'], t['centroid_y'] = float(c[0]), float(c[1])
+    info.update(resampled_from_um=um, work_pixel_um=um2)
     return out, info

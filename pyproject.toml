@@ -33,4 +33,4 @@ rns = "rns.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rns = ["groovy/*.groovy"]
+rns = ["groovy/*.groovy", "models/*.json"]

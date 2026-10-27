@@ -1,5 +1,5 @@
-# model weights are downloaded, never committed
-models/
+# model weights are downloaded, never committed (the nucleus filter's small JSON model in src/rns/models/ is committed)
+/models/
 *.pb
 *.pt
 *.pth
