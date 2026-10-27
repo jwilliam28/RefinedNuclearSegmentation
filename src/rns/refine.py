@@ -661,16 +661,24 @@ def refine_image(regions, um, params=None):
     p = params or Params()
     if p.work_pixel_um > 0 and um < p.work_pixel_um / 1.1 and regions:
         return _refine_resampled(regions, um, p)
-    clf = NucleusClassifier(p).fit([(r['rgb'], r['stardist'], r['origin']) for r in regions], um)
+    if p.seed_mode not in ('union', 'coarse_agree'):
+        raise ValueError(f'unknown seed_mode {p.seed_mode!r}')
+    agree = [agreed_seeds(r.get('stardist_coarse', []), r.get('instanseg', [])) if p.seed_mode == 'coarse_agree' else None
+             for r in regions]
+    clf = NucleusClassifier(p).fit([(r['rgb'], r['stardist'] if a is None else a, r['origin']) for r, a in zip(regions, agree)], um)
     per_region = []
-    for r in regions:
+    for r, a in zip(regions, agree):
         rgb, origin = r['rgb'], r['origin']
         shp = rgb.shape[:2]
         pm = clf.prob(rgb, um)
         ps = cv2.GaussianBlur(pm.astype(np.float32), (0, 0), max(0.7, 0.3 / um))
         odm_s = nuclear_od(rgb, um)
-        union, added = union_detections(r['stardist'], r.get('instanseg', []), shp, origin, p)
-        seeds = consolidate(union, r.get('stardist_coarse', []), shp, origin, p, odm_s, ps, um)
+        if a is None:
+            union, added = union_detections(r['stardist'], r.get('instanseg', []), shp, origin, p)
+            seeds = consolidate(union, r.get('stardist_coarse', []), shp, origin, p, odm_s, ps, um)
+        else:                                    # objects both detectors find (coarse StarDist kept where InstanSeg agrees)
+            added = 0
+            seeds = consolidate(list(a), [], shp, origin, p, odm_s, ps, um)
         occ = np.zeros(shp, np.int32)
         for q in seeds:
             lm = poly_mask_local(q, shp, origin)

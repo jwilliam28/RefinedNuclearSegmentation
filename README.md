@@ -127,6 +127,20 @@ nuclei, info = refine_image(regions, um=0.25, params=Params())
 #                                 "stardist": [...], "stardist_coarse": [...], "instanseg": [...]}]
 ```
 
+## Settings of the ASC 2026 poster analyses
+
+The poster ("An Open-Source, Mostly 3D-Printed Slide Scanner for Cytology", ASC 2026) used the defaults above with one change:
+only objects that both detectors find start the refinement (coarse StarDist outlines whose centre lies inside an InstanSeg
+outline). On Pap tests, objects found by only one detector were mostly folds, cell edges and debris.
+
+```bash
+echo '{"seed_mode": "coarse_agree"}' > poster.json
+rns refine --out runs/my_slide --params poster.json   # the detect run needs --instanseg-model
+```
+
+The nucleus filter still sees all three detectors' outlines. Pap nucleus counts on the poster also left out objects under
+20 µm² (smaller than a superficial squamous nucleus); that cutoff was applied in the analysis, not in this package.
+
 ## Retraining the nucleus filter
 
 1. Run `rns refine`, then open `refined/nucleus_filter_table.csv`.

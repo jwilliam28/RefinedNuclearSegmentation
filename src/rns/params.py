@@ -4,6 +4,12 @@ from dataclasses import dataclass, asdict
 
 @dataclass
 class Params:
+    # seeds: which detector outlines start the refinement
+    seed_mode: str = 'union'                # 'union': fine StarDist + InstanSeg-only additions + coarse consolidation (below);
+                                            # 'coarse_agree': only coarse StarDist outlines whose centre lies inside an InstanSeg
+                                            # outline (objects both detectors find; the setting of the ASC 2026 poster analyses).
+                                            # The nucleus filter always sees all three detectors' outlines.
+
     # union of the two detectors
     instanseg_add_max_cover: float = 0.10   # an InstanSeg nucleus is added only where StarDist covers < 10 % of it
 

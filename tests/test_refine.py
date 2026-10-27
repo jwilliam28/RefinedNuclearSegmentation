@@ -150,3 +150,18 @@ def test_fold_is_one_nucleus_but_side_by_side_pair_stays_two():
         out, _ = refine_image([region], UM, Params(focus_min_ref_nuclei=1, nucleus_filter=False))
         centre = [d for d in out[0] if np.hypot(*(np.asarray(d['poly']).mean(0) - (200, 200))) < 60]
         assert len(centre) == len(truth), (kind, len(centre))
+
+
+def test_coarse_agree_keeps_only_objects_both_detectors_find():
+    img, nuclei = scene(blur_last=False)
+    polys = detector_polys(nuclei)
+    # InstanSeg finds the first three nuclei only; a coarse StarDist object on bare glass has no InstanSeg partner
+    region = dict(rgb=img, origin=(0, 0), stardist=polys, stardist_coarse=polys + [circle(370, 30, 15)],
+                  instanseg=[circle(cx, cy, r) for cx, cy, r in nuclei[:3]])
+    out, info = refine_image([region], UM, Params(focus_min_ref_nuclei=1, nucleus_filter=False, seed_mode='coarse_agree'))
+    assert info['seeds'] == [3]
+    cents = [np.asarray(n['poly']).mean(0) for n in out[0]]
+    assert len(cents) == 3
+    assert all(min(np.hypot(*(c - np.array(nuclei[i][:2]))) for c in cents) < 5 for i in range(3))
+    with pytest.raises(ValueError):
+        refine_image([region], UM, Params(seed_mode='both'))
